@@ -1,6 +1,7 @@
-package app
+package core
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -110,32 +111,45 @@ func TestDetectBuildPlan(t *testing.T) {
 			if err := tt.setup(dir); err != nil {
 				t.Fatal(err)
 			}
-			plan := detectBuildPlan(dir)
-			if plan.label != tt.expect {
-				t.Fatalf("detectBuildPlan() = %q, want %q", plan.label, tt.expect)
+			plan := DetectBuildPlan(dir)
+			if plan.Label != tt.expect {
+				t.Fatalf("DetectBuildPlan() = %q, want %q", plan.Label, tt.expect)
 			}
 		})
 	}
 }
 
 func TestDetectBuildPlanSkipsUnknownProject(t *testing.T) {
-	plan := detectBuildPlan(t.TempDir())
-	if plan.command != "" {
-		t.Fatalf("detectBuildPlan() command = %q, want empty", plan.command)
+	plan := DetectBuildPlan(t.TempDir())
+	if plan.Command != "" {
+		t.Fatalf("DetectBuildPlan() command = %q, want empty", plan.Command)
 	}
 }
 
 func TestDetectBuildPlanSkipsNodeWithoutBuildScript(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "package.json", `{"scripts":{"test":"jest"}}`)
-	if plan := detectBuildPlan(dir); plan.command != "" {
-		t.Fatalf("detectBuildPlan() = %q, want no plan for a package.json without build script", plan.command)
+	if plan := DetectBuildPlan(dir); plan.Command != "" {
+		t.Fatalf("DetectBuildPlan() = %q, want no plan for a package.json without build script", plan.Command)
 	}
 }
 
-func TestBuildRepositorySkipsUnknownProject(t *testing.T) {
-	result := buildRepository(t.TempDir())
-	if !result.skipped {
-		t.Fatalf("buildRepository() skipped = false, want true for unknown project")
+func TestBuildProjectSkipsUnknownProject(t *testing.T) {
+	result := BuildProject(context.Background(), t.TempDir())
+	if !result.Skipped {
+		t.Fatalf("BuildProject() skipped = false, want true for unknown project")
+	}
+}
+
+// TestDetectBuildPlanConcurrent verifies the parallel stat fan-out still
+// honours the manifest priority order when several manifests coexist.
+func TestDetectBuildPlanPriorityUnderConcurrency(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"go.mod", "Makefile", "Cargo.toml"} {
+		writeFile(t, dir, name, "")
+	}
+	plan := DetectBuildPlan(dir)
+	if plan.Label != "go build ./..." {
+		t.Fatalf("DetectBuildPlan() = %q, want the highest-priority go plan", plan.Label)
 	}
 }
