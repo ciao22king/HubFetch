@@ -90,7 +90,9 @@ func ParseRepository(raw string) (Repository, error) {
 	default:
 		// Windows temp paths look like "C:\Users\…" — the colon before a
 		// backslash makes url.Parse read "\Users…" as an invalid port. Turn
-		// plain absolute filesystem paths into proper file:// URLs first.
+		// plain absolute filesystem paths into proper file:// URLs first,
+		// then canonicalize any Windows-style file:// URL the same way.
+		normalized = normalizeFileURL(normalized)
 		if isWindowsAbsPath(normalized) {
 			normalized = "file:///" + strings.ReplaceAll(normalized, "\\", "/")
 		}
@@ -146,6 +148,23 @@ func isWindowsAbsPath(s string) bool {
 	c := s[0]
 	drive := (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
 	return drive && (s[2] == '\\' || s[2] == '/')
+}
+
+// normalizeFileURL rewrites Windows-style file URLs such as
+// "file://C:\Users\me\repo" or "file://C:/Users/me/repo" into the canonical
+// "file:///C:/Users/me/repo" form. net/url otherwise reads the drive letter as
+// the host and the rest as an invalid port, which is exactly the failure seen
+// when tests build "file://" + t.TempDir() on Windows.
+func normalizeFileURL(raw string) string {
+	rest, ok := strings.CutPrefix(raw, "file://")
+	if !ok || strings.HasPrefix(rest, "/") {
+		return raw
+	}
+	rest = strings.ReplaceAll(rest, "\\", "/")
+	if !isWindowsAbsPath(rest) {
+		return raw
+	}
+	return "file:///" + rest
 }
 
 func looksLikeHost(host string) bool {

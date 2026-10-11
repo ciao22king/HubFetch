@@ -25,6 +25,8 @@ func TestParseRepository(t *testing.T) {
 		{"trailing slash", "https://github.com/owner/project/", "GitHub", "project"},
 		{"local file url", "file:///tmp/mirrors/project", "Local", "project"},
 		{"local file url with .git", "file:///home/dev/project.git", "Local", "project"},
+		{"windows file url", `file://C:\Users\runner\AppData\Local\Temp\repo\001`, "Local", "001"},
+		{"windows file url forward slashes", "file://C:/Users/runner/repo", "Local", "repo"},
 	}
 
 	for _, tt := range tests {
@@ -37,6 +39,17 @@ func TestParseRepository(t *testing.T) {
 				t.Fatalf("ParseRepository() = %#v, want provider %q name %q", got, tt.provider, tt.repoName)
 			}
 		})
+	}
+}
+
+func TestParseRepositoryNormalizesWindowsFileURL(t *testing.T) {
+	got, err := ParseRepository(`file://C:\Users\runner\AppData\Local\Temp\repo\001`)
+	if err != nil {
+		t.Fatalf("ParseRepository() error = %v", err)
+	}
+	want := "file:///C:/Users/runner/AppData/Local/Temp/repo/001"
+	if got.URL != want {
+		t.Fatalf("ParseRepository().URL = %q, want %q", got.URL, want)
 	}
 }
 
