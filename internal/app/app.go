@@ -1,3 +1,6 @@
+// Package tui implements GoFetch's Bubble Tea interface. It is deliberately
+// thin: every piece of logic lives in internal/core and internal/fetch, so
+// this package only translates messages into screens and back.
 package app
 
 import (
@@ -12,6 +15,8 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/ciao22king/GoFetch/internal/core"
 )
 
 type screen int
@@ -25,29 +30,47 @@ const (
 	resultScreen
 )
 
-type model struct {
-	screen        screen
-	urlInput      textinput.Model
-	branchInput   textinput.Model
-	dirInput      textinput.Model
-	searchInput   textinput.Model
-	spinner       spinner.Model
-	repository    repository
-	result        cloneResultMsg
-	history       []historyEntry
-	filtered      []int
-	selected      int
-	err           error
-	status        string
-	width         int
-	height        int
-	version       string
-	startedAt     time.Time
-	initialURL    string
-	initialBranch string
-	quitting      bool
-	searchActive  bool
+// Options configures a GoFetch interactive run.
+type Options struct {
+	InitialURL    string
+	InitialBranch string
+	InitialDir    string
+	Version       string
+	NoBuild       bool
+	// Depth limits the clone to that many commits (0 = full clone).
+	Depth int
+	// Overwrite replaces an existing non-empty destination without asking.
+	// Only meaningful for headless runs; the TUI always asks first.
+	Overwrite bool
+}
 
+// maxProgressLines bounds how much clone output the UI keeps in memory and
+// shows; older lines scroll out of view.
+const maxProgressLines = 200
+
+type model struct {
+	screen      screen
+	urlInput    textinput.Model
+	branchInput textinput.Model
+	dirInput    textinput.Model
+	searchInput textinput.Model
+	spinner     spinner.Model
+	repository  core.Repository
+	result      fetchResultMsg
+	history     []core.Entry
+	filtered    []int
+	selected    int
+	err         error
+	status      string
+	width       int
+	height      int
+	version     string
+	startedAt   time.Time
+	quitting    bool
+	// urlSubmitted blocks duplicate Enter presses on the URL screen from
+	// launching parallel ls-remote lookups for the same repository.
+	urlSubmitted     bool
+	searchActive     bool
 	confirmOverwrite bool
 	suggestionIndex  int
 	cancelClone      context.CancelFunc
@@ -66,6 +89,8 @@ type model struct {
 	// pendingPull is the target currently being updated with git pull, so the
 	// history screen can show that work is in progress.
 	pendingPull string
+
+	store *core.Store
 }
 
 var (
@@ -76,6 +101,8 @@ var (
 	ink     = lipgloss.Color("#E2E8F0")
 	danger  = lipgloss.Color("#FB7185")
 
+	// Styles are built once at startup: rebuilding them per frame was the
+	// single biggest cost of the old View().
 	logoStyle = lipgloss.NewStyle().
 			Foreground(ink).
 			Bold(true).
@@ -87,7 +114,19 @@ var (
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color("#334155")).
 			Padding(1, 2)
-	helpStyle = lipgloss.NewStyle().Foreground(muted)
+	helpStyle     = lipgloss.NewStyle().Foreground(muted)
+	titleStyle    = lipgloss.NewStyle().Foreground(ink).Bold(true)
+	badgeStyle    = lipgloss.NewStyle().Foreground(cyan).Bold(true)
+	rowNameStyle  = lipgloss.NewStyle().Foreground(ink)
+	rowMetaStyle  = lipgloss.NewStyle().Foreground(muted)
+	errorStyle    = lipgloss.NewStyle().Foreground(danger)
+	dangerStyle   = lipgloss.NewStyle().Foreground(danger).Bold(true)
+	successStyle  = lipgloss.NewStyle().Foreground(green).Bold(true)
+	targetStyle   = lipgloss.NewStyle().Foreground(ink)
+	progressStyle = lipgloss.NewStyle().Foreground(muted)
+	pillStyle     = lipgloss.NewStyle().Foreground(muted).Background(lipgloss.Color("#1E293B")).Padding(0, 1)
+	shallowPill   = lipgloss.NewStyle().Foreground(cyan).Background(lipgloss.Color("#1E293B")).Padding(0, 1)
+	frameStyle    = lipgloss.NewStyle() // width/margins set per resize in newModel/WindowSize
 )
 
 type keys struct {
@@ -131,22 +170,7 @@ var appKeys = keys{
 	),
 }
 
-type copiedMsg struct{ err error }
-
-// Options configures a GoFetch run.
-type Options struct {
-	InitialURL    string
-	InitialBranch string
-	InitialDir    string
-	Version       string
-	NoBuild       bool
-	// Depth limits the clone to that many commits (0 = full clone).
-	Depth int
-	// Overwrite replaces an existing non-empty destination without asking.
-	// Only meaningful for headless runs; the TUI always asks first.
-	Overwrite bool
-}
-
+// Run starts the interactive program.
 func Run(opts Options) error {
 	program := tea.NewProgram(newModel(opts), tea.WithAltScreen())
 	_, err := program.Run()
@@ -184,6 +208,9 @@ func newModel(opts Options) model {
 	spin.Spinner = spinner.Dot
 	spin.Style = lipgloss.NewStyle().Foreground(cyan)
 
+	storeDir, storeErr := core.DefaultStoreDir()
+	store := core.NewStore(storeDir)
+
 	m := model{
 		urlInput:      urlInput,
 		branchInput:   branchInput,
@@ -191,33 +218,41 @@ func newModel(opts Options) model {
 		searchInput:   searchInput,
 		spinner:       spin,
 		version:       opts.Version,
-		initialURL:    opts.InitialURL,
-		initialBranch: opts.InitialBranch,
-		history:       loadHistory(),
+		history:       store.Load(),
 		noBuild:       opts.NoBuild,
 		depth:         opts.Depth,
 		branchCycling: -1,
+		store:         store,
+	}
+	if storeErr != nil {
+		m.store = nil // nowhere to persist: keep running without history
+		m.history = nil
 	}
 	m.refreshFilter()
+
+	// The URL is parsed exactly once up front; a bad one only shows an error.
+	parsedRepo, parseErr := core.ParseRepository(opts.InitialURL)
+	urlIsValid := opts.InitialURL != "" && parseErr == nil
+
 	switch {
-	case opts.InitialURL != "" && opts.InitialBranch != "":
+	case urlIsValid && opts.InitialBranch != "":
 		// Both provided on the command line: skip straight to the destination.
-		if repo, err := parseRepository(opts.InitialURL); err == nil {
-			m.repository = repo
-			m.branchInput.SetValue(opts.InitialBranch)
-			m.screen = destinationScreen
-			m.dirInput.Focus()
-		} else {
-			m.err = err
-			m.screen = urlScreen
-			urlInput.Focus()
-		}
-	case opts.InitialURL != "":
+		m.repository = parsedRepo
+		m.branchInput.SetValue(opts.InitialBranch)
+		m.screen = destinationScreen
+		m.dirInput.Focus()
+	case urlIsValid:
 		m.screen = urlScreen
-		urlInput.Focus()
+		m.urlInput.Focus()
 	default:
 		m.screen = historyScreen
-		urlInput.Blur()
+		if opts.InitialURL != "" && parseErr != nil {
+			// Invalid URL from the command line: show it so the user can fix it.
+			m.err = parseErr
+			m.urlInput.SetValue(opts.InitialURL)
+			m.urlInput.Focus()
+			m.screen = urlScreen
+		}
 	}
 	return m
 }
@@ -229,7 +264,7 @@ func (m model) Init() tea.Cmd {
 // refreshFilter recomputes the visible history indexes and keeps the selection
 // inside bounds. It is called whenever the history or the search query changes.
 func (m *model) refreshFilter() {
-	m.filtered = searchHistory(m.history, m.searchInput.Value())
+	m.filtered = core.Search(m.history, m.searchInput.Value())
 	if len(m.filtered) == 0 {
 		m.selected = 0
 		return
@@ -246,84 +281,33 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
-		m.urlInput.Width = min(70, max(35, msg.Width-16))
-		m.branchInput.Width = m.urlInput.Width
-		m.dirInput.Width = m.urlInput.Width
-		m.searchInput.Width = m.urlInput.Width
+		inputWidth := min(70, max(35, msg.Width-16))
+		m.urlInput.Width = inputWidth
+		m.branchInput.Width = inputWidth
+		m.dirInput.Width = inputWidth
+		m.searchInput.Width = inputWidth
 		return m, nil
 	case clipboardMsg:
-		if msg.err != nil {
-			m.status = "Clipboard non disponibile: " + compactError(msg.err)
-			return m, nil
-		}
-		if strings.TrimSpace(msg.value) == "" {
-			m.status = "La clipboard è vuota."
-			return m, nil
-		}
-		switch m.screen {
-		case urlScreen:
-			m.urlInput.SetValue(strings.TrimSpace(msg.value))
-			m.status = "URL incollato dalla clipboard."
-		case branchScreen:
-			m.branchInput.SetValue(strings.TrimSpace(msg.value))
-			m.status = "Branch incollato dalla clipboard."
-		case destinationScreen:
-			m.dirInput.SetValue(strings.TrimSpace(msg.value))
-			m.status = "Percorso incollato dalla clipboard."
-		}
-		return m, nil
+		return m.applyClipboard(msg)
 	case copiedMsg:
 		if msg.err != nil {
-			m.status = "Copia non riuscita: " + compactError(msg.err)
+			m.status = "Copia non riuscita: " + core.CompactError(msg.err)
 		} else {
 			m.status = "Percorso copiato nella clipboard."
 		}
 		return m, nil
 	case progressMsg:
-		if m.screen == cloningScreen && strings.TrimSpace(msg.line) != "" {
-			m.progressLog = append(m.progressLog, msg.line)
-			if len(m.progressLog) > maxProgressLines {
-				m.progressLog = m.progressLog[len(m.progressLog)-maxProgressLines:]
-			}
-		}
-		if m.progressChan != nil {
-			return m, waitForProgress(m.progressChan)
-		}
-		return m, nil
+		return m.recordProgress(msg)
 	case progressTickMsg:
 		if m.screen == cloningScreen {
 			return m, progressTick()
 		}
 		return m, nil
-	case cloneResultMsg:
-		m.cancelClone = nil
-		m.result = msg
-		m.progressChan = nil
-		if msg.err == nil {
-			entry := historyEntry{
-				repository: m.repository,
-				Target:     msg.target,
-			}
-			m.history = upsertHistory(m.history, entry)
-			m.selected = 0
-			m.refreshFilter()
-			if err := saveHistory(m.history); err != nil {
-				m.status = "Clone completato, ma non riesco a salvare la cronologia."
-			} else if msg.build.command != "" && msg.build.err != nil {
-				m.status = fmt.Sprintf("Clone completato, ma la build è fallita (%s): %s", msg.build.command, compactError(msg.build.err))
-			} else if msg.build.command != "" {
-				m.status = fmt.Sprintf("Clone e build completati (%s).", msg.build.command)
-			} else {
-				m.status = "Clone completato e aggiunto ai fetch recenti. Nessuna build riconosciuta."
-			}
-			m.screen = historyScreen
-		} else {
-			m.screen = resultScreen
-		}
-		return m, nil
+	case fetchResultMsg:
+		return m.applyFetchResult(msg)
 	case openResultMsg:
 		if msg.err != nil {
-			m.status = "Non riesco ad aprire la cartella: " + compactError(msg.err)
+			m.status = "Non riesco ad aprire la cartella: " + core.CompactError(msg.err)
 		} else {
 			m.status = "Cartella aperta: " + msg.target
 		}
@@ -338,12 +322,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case pullResultMsg:
 		m.pendingPull = ""
 		if msg.err != nil {
-			m.status = "Aggiornamento fallito: " + compactError(msg.err)
+			m.status = "Aggiornamento fallito: " + core.CompactError(msg.err)
 		} else {
 			m.status = msg.summary
 		}
 		return m, nil
 	case tea.KeyMsg:
+		// Global shortcuts (ctrl+c, open, copy, quit…) win over the screens —
+		// but only when they actually *consume* the key. handleGlobalKey returns
+		// handled=true exclusively for keys it acted upon; plain typing like "q"
+		// inside a focused text field is deliberately left unclaimed so it
+		// reaches the input below and can never quit the app while typing.
 		if cmd, handled := m.handleGlobalKey(msg); handled {
 			return m, cmd
 		}
@@ -375,6 +364,74 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m model) applyClipboard(msg clipboardMsg) (tea.Model, tea.Cmd) {
+	if msg.err != nil {
+		m.status = "Clipboard non disponibile: " + core.CompactError(msg.err)
+		return m, nil
+	}
+	value := strings.TrimSpace(msg.value)
+	if value == "" {
+		m.status = "La clipboard è vuota."
+		return m, nil
+	}
+	switch m.screen {
+	case urlScreen:
+		m.urlInput.SetValue(value)
+		m.status = "URL incollato dalla clipboard."
+	case branchScreen:
+		m.branchInput.SetValue(value)
+		m.status = "Branch incollato dalla clipboard."
+	case destinationScreen:
+		m.dirInput.SetValue(value)
+		m.status = "Percorso incollato dalla clipboard."
+	}
+	return m, nil
+}
+
+func (m model) recordProgress(msg progressMsg) (tea.Model, tea.Cmd) {
+	if m.screen == cloningScreen && strings.TrimSpace(msg.line) != "" {
+		m.progressLog = append(m.progressLog, msg.line)
+		if len(m.progressLog) > maxProgressLines {
+			m.progressLog = m.progressLog[len(m.progressLog)-maxProgressLines:]
+		}
+	}
+	if m.progressChan != nil {
+		return m, waitForProgress(m.progressChan)
+	}
+	return m, nil
+}
+
+func (m model) applyFetchResult(msg fetchResultMsg) (tea.Model, tea.Cmd) {
+	m.cancelClone = nil
+	m.result = msg
+	m.progressChan = nil
+	if msg.err == nil {
+		entry := core.Entry{Repository: m.repository, Target: msg.target}
+		if m.store != nil {
+			m.history = core.Upsert(m.history, entry)
+			if err := m.store.Save(m.history); err != nil {
+				m.status = "Clone completato, ma non riesco a salvare la cronologia."
+			}
+		}
+		m.selected = 0
+		m.refreshFilter()
+		switch {
+		case m.store == nil:
+			m.status = "Clone completato."
+		case msg.build.Command != "" && msg.build.Err != nil:
+			m.status = fmt.Sprintf("Clone completato, ma la build è fallita (%s): %s", msg.build.Command, core.CompactError(msg.build.Err))
+		case msg.build.Command != "":
+			m.status = fmt.Sprintf("Clone e build completati (%s).", msg.build.Command)
+		default:
+			m.status = "Clone completato e aggiunto ai fetch recenti. Nessuna build riconosciuta."
+		}
+		m.screen = historyScreen
+	} else {
+		m.screen = resultScreen
+	}
+	return m, nil
+}
+
 // handleGlobalKey covers shortcuts that behave the same everywhere. Typing
 // shortcuts like "q" are deliberately excluded from text-entry screens so a URL
 // or a path containing the letter q can never quit the app.
@@ -393,21 +450,23 @@ func (m model) handleGlobalKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 		if m.screen == resultScreen && m.result.target != "" {
 			return openRepository(m.result.target), true
 		}
-		if m.screen == historyScreen && len(m.filtered) > 0 {
+		if m.screen == historyScreen && !m.searchActive && len(m.filtered) > 0 {
 			entry := m.history[m.filtered[m.selected]]
-			m.status = "Apro " + historyLabel(entry) + "…"
+			m.status = "Apro " + entry.Label() + "…"
 			return openRepository(entry.Target), true
 		}
-		return nil, true
+		// Nothing to open here: don't claim the key.
+		return nil, false
 	}
 	if key.Matches(msg, appKeys.copy) {
 		if m.screen == resultScreen && m.result.target != "" {
 			return copyPath(m.result.target), true
 		}
-		if m.screen == historyScreen && len(m.filtered) > 0 {
+		if m.screen == historyScreen && !m.searchActive && len(m.filtered) > 0 {
 			return copyPath(m.history[m.filtered[m.selected]].Target), true
 		}
-		return nil, true
+		// Nothing to copy here: don't claim the key.
+		return nil, false
 	}
 	if key.Matches(msg, appKeys.quit) {
 		typing := (m.screen == historyScreen && m.searchActive) ||
@@ -415,6 +474,23 @@ func (m model) handleGlobalKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 		if !typing {
 			m.quitting = true
 			return tea.Quit, true
+		}
+		// The user is typing in a text field: "q" is just a character.
+		return nil, false
+	}
+	// Search and remove are only real shortcuts on the history screen while
+	// not typing; elsewhere "/" or "ctrl+d" must reach the active input.
+	if m.screen == historyScreen && !m.searchActive {
+		if key.Matches(msg, appKeys.remove) {
+			m.removeSelected()
+			return nil, true
+		}
+		if key.Matches(msg, appKeys.search) {
+			m.searchActive = true
+			m.status = ""
+			m.err = nil
+			m.searchInput.Focus()
+			return textinput.Blink, true
 		}
 	}
 	return nil, false
@@ -437,19 +513,15 @@ func (m model) updateHistory(msg tea.Msg) (tea.Model, tea.Cmd) {
 				entry := m.history[m.filtered[m.selected]]
 				m.searchActive = false
 				m.searchInput.Blur()
-				m.status = "Apro " + historyLabel(entry) + "…"
+				m.status = "Apro " + entry.Label() + "…"
 				return m, openRepository(entry.Target)
 			}
 			return m, nil
 		case tea.KeyUp:
-			if len(m.filtered) > 0 {
-				m.selected = max(0, m.selected-1)
-			}
+			m.moveSelection(-1)
 			return m, nil
 		case tea.KeyDown:
-			if len(m.filtered) > 0 {
-				m.selected = min(len(m.filtered)-1, m.selected+1)
-			}
+			m.moveSelection(1)
 			return m, nil
 		}
 		var cmd tea.Cmd
@@ -461,13 +533,9 @@ func (m model) updateHistory(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch keyMsg.String() {
 	case "up", "k":
-		if len(m.filtered) > 0 {
-			m.selected = max(0, m.selected-1)
-		}
+		m.moveSelection(-1)
 	case "down", "j":
-		if len(m.filtered) > 0 {
-			m.selected = min(len(m.filtered)-1, m.selected+1)
-		}
+		m.moveSelection(1)
 	case "n", "c":
 		m.status = ""
 		m.err = nil
@@ -476,15 +544,17 @@ func (m model) updateHistory(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.urlInput.Focus()
 		return m, textinput.Blink
 	case "r":
-		m.history = loadHistory()
-		m.refreshFilter()
+		if m.store != nil {
+			m.history = m.store.Load()
+			m.refreshFilter()
+		}
 		m.status = "Cronologia aggiornata."
 	case "u":
 		// Update the selected clone in place with a fast-forward pull.
 		if len(m.filtered) > 0 && m.pendingPull == "" {
 			entry := m.history[m.filtered[m.selected]]
 			m.pendingPull = entry.Target
-			m.status = "Aggiorno " + historyLabel(entry) + "…"
+			m.status = "Aggiorno " + entry.Label() + "…"
 			return m, pullRepository(entry.Target)
 		}
 	case "ctrl+l", "/":
@@ -493,24 +563,40 @@ func (m model) updateHistory(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.searchInput.Focus()
 		return m, textinput.Blink
 	case "ctrl+d":
-		if len(m.filtered) > 0 {
-			entry := m.history[m.filtered[m.selected]]
-			m.history = removeHistoryEntry(m.history, entry.Target)
-			m.refreshFilter()
-			if err := saveHistory(m.history); err != nil {
-				m.status = "Voce rimossa, ma non riesco a salvare la cronologia."
-			} else {
-				m.status = "Voce rimossa: " + historyLabel(entry)
-			}
-		}
+		m.removeSelected()
 	case "enter":
 		if len(m.filtered) > 0 {
 			entry := m.history[m.filtered[m.selected]]
-			m.status = "Apro " + historyLabel(entry) + "…"
+			m.status = "Apro " + entry.Label() + "…"
 			return m, openRepository(entry.Target)
 		}
 	}
 	return m, nil
+}
+
+func (m *model) moveSelection(delta int) {
+	if len(m.filtered) == 0 {
+		return
+	}
+	m.selected = min(max(0, m.selected+delta), len(m.filtered)-1)
+}
+
+func (m *model) removeSelected() {
+	if len(m.filtered) == 0 {
+		return
+	}
+	entry := m.history[m.filtered[m.selected]]
+	m.history = core.Remove(m.history, entry.Target)
+	m.refreshFilter()
+	if m.store == nil {
+		m.status = "Voce rimossa."
+		return
+	}
+	if err := m.store.Save(m.history); err != nil {
+		m.status = "Voce rimossa, ma non riesco a salvare la cronologia."
+	} else {
+		m.status = "Voce rimossa: " + entry.Label()
+	}
 }
 
 func (m model) updateURL(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -524,11 +610,17 @@ func (m model) updateURL(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if key.Matches(msg, appKeys.enter) {
-			repo, err := parseRepository(m.urlInput.Value())
+			if m.urlSubmitted && msg.String() == "enter" {
+				// Enter is being held down (auto-repeat): ignore the extra
+				// presses so one submission can never spawn parallel lookups.
+				return m, nil
+			}
+			repo, err := core.ParseRepository(m.urlInput.Value())
 			if err != nil {
 				m.err = err
 				return m, nil
 			}
+			m.urlSubmitted = true
 			m.repository = repo
 			m.err = nil
 			m.status = ""
@@ -541,6 +633,17 @@ func (m model) updateURL(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Warm the branch completion cache while the user reads the
 			// screen; failures are silent, Tab just has nothing to suggest.
 			return m, tea.Batch(textinput.Blink, fetchRemoteBranches(repo.URL))
+		}
+	default:
+		// Backspace/delete/reset re-arms Enter after a held-key repeat.
+		switch msg.(type) {
+		case tea.KeyMsg:
+			km := msg.(tea.KeyMsg)
+			if km.Type != tea.KeyRunes {
+				m.urlSubmitted = false
+			}
+		default:
+			m.urlSubmitted = false
 		}
 	}
 	var cmd tea.Cmd
@@ -577,7 +680,7 @@ func (m model) updateBranch(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Type == tea.KeyTab {
 			// Tab completes from the remote's branch list; pressing it again
 			// cycles through every match for the current prefix.
-			matches := branchCompletions(m.remoteBranches, m.branchInput.Value())
+			matches := core.BranchCompletions(m.remoteBranches, m.branchInput.Value())
 			if len(matches) > 0 {
 				m.branchCycling = (m.branchCycling + 1) % len(matches)
 				m.branchInput.SetValue(matches[m.branchCycling])
@@ -618,13 +721,13 @@ func (m model) updateDestination(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, textinput.Blink
 		}
 		if key.Matches(msg, appKeys.enter) {
-			target, err := destinationPath(m.dirInput.Value(), m.repository)
+			target, err := core.DestinationPath(m.dirInput.Value(), m.repository)
 			if err != nil {
 				m.err = err
 				return m, nil
 			}
 			m.err = nil
-			if nonEmptyDir(target) {
+			if core.NonEmptyDir(target) {
 				m.confirmOverwrite = true
 				return m, nil
 			}
@@ -664,28 +767,15 @@ func (m model) startClone(overwrite bool) (tea.Model, tea.Cmd) {
 	m.cloneBranch = strings.TrimSpace(m.branchInput.Value())
 	m.progressLog = nil
 	m.progressChan = make(chan string, 256)
-	cmd, cancel := cloneRepository(m.repository, m.dirInput.Value(), m.cloneBranch, overwrite, m.noBuild, m.depth, m.progressChan)
+	cmd, cancel := startFetch(m.repository, m.dirInput.Value(), m.cloneBranch, overwrite, m.noBuild, m.depth, m.store, m.progressChan)
 	m.cancelClone = cancel
 	return m, tea.Batch(m.spinner.Tick, progressTick(), waitForProgress(m.progressChan), cmd)
-}
-
-// waitForProgress blocks on the progress channel until git emits a line or the
-// channel is closed, then hands the line to the TUI. The model re-arms it after
-// every line so progress keeps flowing.
-func waitForProgress(ch chan string) tea.Cmd {
-	return func() tea.Msg {
-		line, ok := <-ch
-		if !ok {
-			return nil
-		}
-		return progressMsg{line: line}
-	}
 }
 
 // nextSuggestion cycles through the most recent destination directories. It
 // uses a pointer receiver so the cursor advances across calls.
 func (m *model) nextSuggestion() string {
-	suggestions := recentDirectories(m.history, 8)
+	suggestions := core.RecentDirectories(m.history, 8)
 	if len(suggestions) == 0 {
 		return ""
 	}
@@ -713,286 +803,8 @@ func (m model) updateResult(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m model) View() string {
-	if m.quitting {
-		return ""
-	}
-	if m.width == 0 {
-		return "starting gofetch..."
-	}
-
-	header := lipgloss.JoinHorizontal(lipgloss.Center,
-		logoStyle.Render("GOFETCH"),
-		"  ",
-		subtitleStyle.Render("clone without the ceremony"),
-		"  ",
-		helpStyle.Render("v"+m.version),
-	)
-	content := lipgloss.JoinVertical(lipgloss.Left, header, "", m.viewBody(), "", m.viewFooter())
-	maxWidth := min(max(m.width-4, 40), 90)
-	return lipgloss.NewStyle().Width(maxWidth).MarginLeft(2).MarginTop(1).Render(content)
-}
-
-func (m model) viewBody() string {
-	switch m.screen {
-	case historyScreen:
-		return m.viewHistory()
-	case urlScreen:
-		return m.viewURL()
-	case branchScreen:
-		return m.viewBranch()
-	case destinationScreen:
-		return m.viewDestination()
-	case cloningScreen:
-		return m.viewCloning()
-	case resultScreen:
-		return m.viewResult()
-	default:
-		return ""
-	}
-}
-
-func (m model) viewHistory() string {
-	title := lipgloss.NewStyle().Foreground(ink).Bold(true).Render("Your fetches")
-	copy := subtitleStyle.Render("Scegli un repository con ↑/↓ e premi Invio per aprire la cartella.")
-
-	var body string
-	switch {
-	case len(m.history) == 0:
-		body = cardStyle.Render(lipgloss.JoinVertical(lipgloss.Left,
-			lipgloss.NewStyle().Foreground(cyan).Bold(true).Render("Nessun fetch ancora"),
-			"",
-			subtitleStyle.Render("Premi n per clonare il tuo primo repository."),
-		))
-	case len(m.filtered) == 0:
-		body = cardStyle.Render(lipgloss.JoinVertical(lipgloss.Left,
-			lipgloss.NewStyle().Foreground(cyan).Bold(true).Render("Nessun risultato"),
-			"",
-			subtitleStyle.Render("Nessun fetch corrisponde a \""+m.searchInput.Value()+"\"."),
-		))
-	default:
-		start := max(0, m.selected-4)
-		end := min(len(m.filtered), start+8)
-		if end-start < 8 {
-			start = max(0, end-8)
-		}
-		rows := make([]string, 0, end-start)
-		for position := start; position < end; position++ {
-			rows = append(rows, m.viewHistoryRow(position, m.history[m.filtered[position]]))
-		}
-		body = cardStyle.Render(lipgloss.JoinVertical(lipgloss.Left, rows...))
-	}
-
-	return lipgloss.JoinVertical(lipgloss.Left, title, copy, "", m.viewSearchBar(), "", body, m.viewStatus())
-}
-
-func (m model) viewSearchBar() string {
-	switch {
-	case m.searchActive:
-		return cardStyle.Render(m.searchInput.View())
-	case strings.TrimSpace(m.searchInput.Value()) != "":
-		return helpStyle.Render("  filtro attivo: \"" + m.searchInput.Value() + "\"   •   ctrl+l per modificare")
-	default:
-		return helpStyle.Render("  / oppure ctrl+l per cercare nella cronologia")
-	}
-}
-
-func (m model) viewHistoryRow(position int, entry historyEntry) string {
-	prefix := "  "
-	nameStyle := lipgloss.NewStyle().Foreground(ink)
-	if position == m.selected {
-		prefix = "› "
-		nameStyle = nameStyle.Foreground(cyan).Bold(true)
-	}
-	name := nameStyle.Render(historyLabel(entry))
-	provider := lipgloss.NewStyle().Foreground(muted).Render(entry.Provider)
-	when := lipgloss.NewStyle().Foreground(muted).Render(relativeTime(entry.FetchedAt))
-	target := lipgloss.NewStyle().Foreground(muted).Render(entry.Target)
-	return lipgloss.JoinVertical(lipgloss.Left,
-		prefix+name+"  "+provider+"  "+when,
-		"   "+target,
-	)
-}
-
-func (m model) viewURL() string {
-	title := lipgloss.NewStyle().Foreground(ink).Bold(true).Render("Where are we going?")
-	copy := subtitleStyle.Render("Paste a GitHub or GitLab URL. HTTPS and SSH both work.")
-	field := cardStyle.Render(
-		lipgloss.JoinVertical(lipgloss.Left,
-			labelStyle.Render("REPOSITORY URL"),
-			m.urlInput.View(),
-			"",
-			providerPill("GITHUB", "github.com")+"  "+providerPill("GITLAB", "gitlab.com"),
-		),
-	)
-	return lipgloss.JoinVertical(lipgloss.Left, title, copy, "", field, m.viewError(), m.viewStatus())
-}
-
-func (m model) viewBranch() string {
-	title := lipgloss.NewStyle().Foreground(ink).Bold(true).Render("Which branch?")
-	copy := subtitleStyle.Render("Optional: lascia vuoto per il branch predefinito del repository.")
-	repoBadge := lipgloss.NewStyle().Foreground(cyan).Bold(true).Render(m.repository.Provider + "  ·  " + m.repository.Name)
-	if len(m.remoteBranches) > 0 {
-		repoBadge += lipgloss.NewStyle().Foreground(muted).Render(fmt.Sprintf("  ·  %d branch disponibili (tab per completare)", len(m.remoteBranches)))
-	}
-	field := cardStyle.Render(
-		lipgloss.JoinVertical(lipgloss.Left,
-			repoBadge,
-			"",
-			labelStyle.Render("BRANCH (OPZIONALE)"),
-			m.branchInput.View(),
-		),
-	)
-	return lipgloss.JoinVertical(lipgloss.Left, title, copy, "", field, m.viewError(), m.viewStatus())
-}
-
-func (m model) viewDestination() string {
-	title := lipgloss.NewStyle().Foreground(ink).Bold(true).Render("Where should we put it?")
-	copy := subtitleStyle.Render("GoFetch creates a folder named after the repository.")
-	repoBadge := lipgloss.NewStyle().Foreground(cyan).Bold(true).Render(m.repository.Provider + "  ·  " + m.repository.Name)
-
-	branch := strings.TrimSpace(m.branchInput.Value())
-	if branch == "" {
-		branch = "predefinito"
-	}
-	badge := repoBadge + lipgloss.NewStyle().Foreground(muted).Render("   branch: "+branch)
-	if m.depth > 0 {
-		badge += "  " + lipgloss.NewStyle().
-			Foreground(cyan).
-			Background(lipgloss.Color("#1E293B")).
-			Padding(0, 1).
-			Render(fmt.Sprintf("SHALLOW depth=%d", m.depth))
-	}
-
-	// Destination preview: show exactly where git will write before the clone
-	// starts, so an absolute target can never surprise the user.
-	preview := ""
-	if target, err := destinationPath(m.dirInput.Value(), m.repository); err == nil {
-		preview = lipgloss.NewStyle().Foreground(muted).Render("→ " + target)
-	}
-
-	field := cardStyle.Render(
-		lipgloss.JoinVertical(lipgloss.Left,
-			badge,
-			"",
-			labelStyle.Render("PARENT DIRECTORY"),
-			m.dirInput.View(),
-			"",
-			preview,
-		),
-	)
-
-	extra := ""
-	if m.confirmOverwrite {
-		extra = "\n" + lipgloss.NewStyle().Foreground(danger).Bold(true).
-			Render("  La cartella esiste già: Invio la sostituisce, Esc annulla.")
-	}
-	return lipgloss.JoinVertical(lipgloss.Left, title, copy, "", field, m.viewError(), m.viewStatus()+extra)
-}
-
-func (m model) viewCloning() string {
-	elapsed := time.Since(m.startedAt).Round(time.Second)
-	title := lipgloss.NewStyle().Foreground(ink).Bold(true).Render("Fetching your repository")
-	target := m.repository.Provider + "  ·  " + m.repository.Name
-	if m.cloneBranch != "" {
-		target += "  ·  " + m.cloneBranch
-	}
-	if m.depth > 0 {
-		target += fmt.Sprintf("  ·  shallow depth=%d", m.depth)
-	}
-	status := lipgloss.NewStyle().Foreground(cyan).Render(m.spinner.View() + "  clone + build automatici in corso…")
-	timer := helpStyle.Render(fmt.Sprintf("elapsed %s   •   esc per annullare", elapsed))
-
-	lines := []string{title, "", subtitleStyle.Render(target), status, timer}
-	if len(m.progressLog) > 0 {
-		lines = append(lines, "")
-		for _, line := range tailStrings(m.progressLog, 8) {
-			lines = append(lines, lipgloss.NewStyle().Foreground(muted).Render("  "+truncateLine(line, 76)))
-		}
-	}
-	return cardStyle.Render(lipgloss.JoinVertical(lipgloss.Left, lines...))
-}
-
-func tailStrings(values []string, limit int) []string {
-	if limit > 0 && len(values) > limit {
-		return values[len(values)-limit:]
-	}
-	return values
-}
-
-func truncateLine(value string, limit int) string {
-	value = strings.TrimSpace(value)
-	runes := []rune(value)
-	if limit > 0 && len(runes) > limit {
-		return string(runes[:limit-1]) + "…"
-	}
-	return value
-}
-
-func (m model) viewResult() string {
-	if m.result.err != nil {
-		title := lipgloss.NewStyle().Foreground(danger).Bold(true).Render("Clone failed")
-		detail := subtitleStyle.Render(compactError(m.result.err))
-		help := helpStyle.Render("Check the URL, your SSH key, or your Git credentials.")
-		return cardStyle.Render(lipgloss.JoinVertical(lipgloss.Left, title, "", detail, help))
-	}
-	title := lipgloss.NewStyle().Foreground(green).Bold(true).Render("Clone complete")
-	target := lipgloss.NewStyle().Foreground(ink).Render(m.result.target)
-	timer := helpStyle.Render(fmt.Sprintf("finished in %s   •   invio apre la cartella", m.result.duration.Round(time.Second)))
-	return cardStyle.Render(lipgloss.JoinVertical(lipgloss.Left, title, "", target, timer))
-}
-
-func (m model) viewError() string {
-	if m.err == nil {
-		return ""
-	}
-	return lipgloss.NewStyle().Foreground(danger).Render("  " + m.err.Error())
-}
-
-func (m model) viewStatus() string {
-	if m.status == "" {
-		return ""
-	}
-	return helpStyle.Render("  " + m.status)
-}
-
-func (m model) viewFooter() string {
-	switch m.screen {
-	case historyScreen:
-		return helpStyle.Render("↑/↓ scegli   •   enter apri   •   u aggiorna   •   n nuovo   •   / cerca   •   ctrl+d rimuovi   •   q esci")
-	case urlScreen:
-		return helpStyle.Render("ctrl+v incolla   •   enter continua   •   esc indietro   •   ctrl+c esci")
-	case branchScreen:
-		return helpStyle.Render("tab completa dal remote   •   vuoto = predefinito   •   enter continua   •   esc indietro")
-	case destinationScreen:
-		return helpStyle.Render("ctrl+v incolla   •   tab suggerimento   •   s shallow   •   enter clona   •   esc indietro")
-	case cloningScreen:
-		return helpStyle.Render("attendi   •   esc annulla")
-	case resultScreen:
-		return helpStyle.Render("enter apri   •   ctrl+y copia percorso   •   esc indietro   •   q esci")
-	default:
-		return ""
-	}
-}
-
-func providerPill(label, value string) string {
-	return lipgloss.NewStyle().
-		Foreground(muted).
-		Background(lipgloss.Color("#1E293B")).
-		Padding(0, 1).
-		Render(label + "  " + value)
-}
-
 func copyPath(target string) tea.Cmd {
 	return func() tea.Msg {
 		return copiedMsg{err: clipboard.WriteAll(target)}
 	}
-}
-
-func compactError(err error) string {
-	message := strings.TrimSpace(err.Error())
-	if len(message) > 160 {
-		return message[:157] + "..."
-	}
-	return message
 }

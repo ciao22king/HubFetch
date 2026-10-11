@@ -1,4 +1,4 @@
-package app
+package core
 
 import (
 	"os"
@@ -16,37 +16,36 @@ func withConfigDir(t *testing.T) string {
 }
 
 func TestLoadConfigMissing(t *testing.T) {
-	withConfigDir(t)
-	cfg := LoadConfig()
+	dir := withConfigDir(t)
+	cfg := LoadConfig(filepath.Join(dir, "gofetch"))
 	if cfg != (Config{}) {
 		t.Fatalf("LoadConfig() with no file = %+v, want zero Config", cfg)
 	}
 }
 
 func TestSaveAndLoadConfig(t *testing.T) {
-	dir := withConfigDir(t)
+	dir := filepath.Join(withConfigDir(t), "gofetch")
 	want := Config{DefaultDir: "~/Code", Depth: 1, NoBuild: true}
-	if err := SaveConfig(want); err != nil {
+	if err := SaveConfig(dir, want); err != nil {
 		t.Fatalf("SaveConfig() error: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "gofetch", "config.json")); err != nil {
+	if _, err := os.Stat(filepath.Join(dir, "config.json")); err != nil {
 		t.Fatalf("config file not written: %v", err)
 	}
-	if got := LoadConfig(); got != want {
+	if got := LoadConfig(dir); got != want {
 		t.Fatalf("LoadConfig() = %+v, want %+v", got, want)
 	}
 }
 
 func TestLoadConfigInvalidJSON(t *testing.T) {
-	dir := withConfigDir(t)
-	configDir := filepath.Join(dir, "gofetch")
-	if err := os.MkdirAll(configDir, 0o755); err != nil {
+	dir := filepath.Join(withConfigDir(t), "gofetch")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte("{not json"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte("{not json"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if cfg := LoadConfig(); cfg != (Config{}) {
+	if cfg := LoadConfig(dir); cfg != (Config{}) {
 		t.Fatalf("LoadConfig() with invalid JSON = %+v, want zero Config", cfg)
 	}
 }

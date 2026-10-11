@@ -6,7 +6,17 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/ciao22king/GoFetch/internal/core"
 )
+
+// writePopulatedDir creates dir with one file inside, so NonEmptyDir sees it.
+func writePopulatedDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, "existing"), []byte("x"), 0o644)
+}
 
 func newTestModel(t *testing.T, opts Options) model {
 	t.Helper()
@@ -62,6 +72,9 @@ func TestBranchStepCanBeLeftEmpty(t *testing.T) {
 	if m.cloneBranch != "" {
 		t.Fatalf("cloneBranch = %q, want empty for the default branch", m.cloneBranch)
 	}
+	if m.cancelClone != nil {
+		defer m.cancelClone() // don't leak the pending clone goroutine
+	}
 }
 
 func TestBranchStepCapturesBranch(t *testing.T) {
@@ -77,6 +90,9 @@ func TestBranchStepCapturesBranch(t *testing.T) {
 	}
 	if m.cloneBranch != "release/1.x" {
 		t.Fatalf("cloneBranch = %q, want release/1.x", m.cloneBranch)
+	}
+	if m.cancelClone != nil {
+		defer m.cancelClone()
 	}
 }
 
@@ -121,13 +137,13 @@ func TestProgressLinesAreCapturedAndBounded(t *testing.T) {
 	}
 }
 
-func TestTailAndTruncateHelpers(t *testing.T) {
+func TestTailLinesAndTruncateHelpers(t *testing.T) {
 	values := []string{"a", "b", "c", "d"}
-	if got := tailStrings(values, 2); len(got) != 2 || got[0] != "c" || got[1] != "d" {
-		t.Fatalf("tailStrings() = %v, want [c d]", got)
+	if got := tailLines(values, 2); len(got) != 2 || got[0] != "c" || got[1] != "d" {
+		t.Fatalf("tailLines() = %v, want [c d]", got)
 	}
-	if got := tailStrings(values, 10); len(got) != 4 {
-		t.Fatalf("tailStrings() = %v, want all values", got)
+	if got := tailLines(values, 10); len(got) != 4 {
+		t.Fatalf("tailLines() = %v, want all values", got)
 	}
 	if got := truncateLine("  short  ", 10); got != "short" {
 		t.Fatalf("truncateLine() = %q, want short", got)
@@ -156,7 +172,7 @@ func TestInitialBranchSkipsBranchScreen(t *testing.T) {
 func TestViewsDoNotPanicOnEveryScreen(t *testing.T) {
 	m := newTestModel(t, Options{InitialURL: "https://github.com/owner/project"})
 	m.width, m.height = 100, 40
-	m.repository = repository{Provider: "GitHub", Name: "project", URL: "https://github.com/owner/project"}
+	m.repository = core.Repository{Provider: "GitHub", Name: "project", URL: "https://github.com/owner/project"}
 
 	for _, screen := range []screen{historyScreen, urlScreen, branchScreen, destinationScreen, cloningScreen, resultScreen} {
 		m.screen = screen
@@ -190,10 +206,7 @@ func TestQuitKeyIgnoredWhileTyping(t *testing.T) {
 func TestOverwriteConfirmation(t *testing.T) {
 	parent := t.TempDir()
 	target := filepath.Join(parent, "project")
-	if err := os.MkdirAll(target, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(target, "existing"), []byte("x"), 0o644); err != nil {
+	if err := writePopulatedDir(target); err != nil {
 		t.Fatal(err)
 	}
 
@@ -233,15 +246,19 @@ func TestEscCancelsClone(t *testing.T) {
 	if m.cancelClone == nil {
 		t.Fatal("cancel function should remain until the clone result arrives")
 	}
+	m.cancelClone() // don't leak the pending clone goroutine
 }
 
-func TestCloneSuccessStoresHistory(t *testing.T) {
+func TestFetchSuccessStoresHistory(t *testing.T) {
 	m := newTestModel(t, Options{InitialURL: "https://github.com/owner/project"})
 	m, _ = apply(t, m, tea.KeyMsg{Type: tea.KeyEnter})
 	m, _ = apply(t, m, tea.KeyMsg{Type: tea.KeyEnter})
 	m, _ = apply(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if m.cancelClone != nil {
+		defer m.cancelClone()
+	}
 
-	m, _ = apply(t, m, cloneResultMsg{target: filepath.Join(t.TempDir(), "project")})
+	m, _ = apply(t, m, fetchResultMsg{target: filepath.Join(t.TempDir(), "project")})
 	if m.screen != historyScreen {
 		t.Fatalf("screen = %v, want historyScreen after success", m.screen)
 	}
@@ -250,13 +267,16 @@ func TestCloneSuccessStoresHistory(t *testing.T) {
 	}
 }
 
-func TestCloneFailureShowsResultScreen(t *testing.T) {
+func TestFetchFailureShowsResultScreen(t *testing.T) {
 	m := newTestModel(t, Options{InitialURL: "https://github.com/owner/project"})
 	m, _ = apply(t, m, tea.KeyMsg{Type: tea.KeyEnter})
 	m, _ = apply(t, m, tea.KeyMsg{Type: tea.KeyEnter})
 	m, _ = apply(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if m.cancelClone != nil {
+		defer m.cancelClone()
+	}
 
-	m, _ = apply(t, m, cloneResultMsg{err: errCloneCanceled})
+	m, _ = apply(t, m, fetchResultMsg{err: core.ErrCloneCanceled})
 	if m.screen != resultScreen {
 		t.Fatalf("screen = %v, want resultScreen after failure", m.screen)
 	}
@@ -264,9 +284,9 @@ func TestCloneFailureShowsResultScreen(t *testing.T) {
 
 func TestHistoryNavigationAndSearch(t *testing.T) {
 	m := newTestModel(t, Options{})
-	m.history = []historyEntry{
-		{repository: repository{Name: "alpha", Provider: "GitHub"}, Target: "/code/alpha"},
-		{repository: repository{Name: "beta", Provider: "GitLab"}, Target: "/work/beta"},
+	m.history = []core.Entry{
+		{Repository: core.Repository{Name: "alpha", Provider: "GitHub"}, Target: "/code/alpha"},
+		{Repository: core.Repository{Name: "beta", Provider: "GitLab"}, Target: "/work/beta"},
 	}
 	m.refreshFilter()
 
@@ -294,8 +314,8 @@ func TestHistoryNavigationAndSearch(t *testing.T) {
 
 func TestHistoryRemoveEntry(t *testing.T) {
 	m := newTestModel(t, Options{})
-	m.history = []historyEntry{
-		{repository: repository{Name: "alpha"}, Target: "/code/alpha"},
+	m.history = []core.Entry{
+		{Repository: core.Repository{Name: "alpha"}, Target: "/code/alpha"},
 	}
 	m.refreshFilter()
 	m, _ = apply(t, m, tea.KeyMsg{Type: tea.KeyCtrlD})
@@ -306,7 +326,7 @@ func TestHistoryRemoveEntry(t *testing.T) {
 
 func TestTabCyclesDestinationSuggestions(t *testing.T) {
 	m := newTestModel(t, Options{InitialURL: "https://github.com/owner/project"})
-	m.history = []historyEntry{
+	m.history = []core.Entry{
 		{Target: filepath.Join("/code", "alpha")},
 		{Target: filepath.Join("/work", "beta")},
 	}
@@ -321,5 +341,20 @@ func TestTabCyclesDestinationSuggestions(t *testing.T) {
 	m, _ = apply(t, m, tea.KeyMsg{Type: tea.KeyTab})
 	if m.dirInput.Value() == first {
 		t.Fatal("tab did not cycle to a different suggestion")
+	}
+}
+
+func TestShallowToggleSwitchesDepth(t *testing.T) {
+	m := newTestModel(t, Options{InitialURL: "https://github.com/owner/project"})
+	m, _ = apply(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	m, _ = apply(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	m, _ = apply(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("s")})
+	if m.depth != 1 {
+		t.Fatalf("depth = %d, want 1 after enabling the shallow toggle", m.depth)
+	}
+	m, _ = apply(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("s")})
+	if m.depth != 0 {
+		t.Fatalf("depth = %d, want 0 after disabling the shallow toggle", m.depth)
 	}
 }

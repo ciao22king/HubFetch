@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/ciao22king/GoFetch/internal/core"
 )
 
 // RunHeadless clones a repository without the TUI: it is what powers
@@ -17,7 +19,7 @@ import (
 // stderr and the final destination path to stdout, so the path can be
 // captured with command substitution.
 func RunHeadless(opts Options) error {
-	repo, err := parseRepository(opts.InitialURL)
+	repo, err := core.ParseRepository(opts.InitialURL)
 	if err != nil {
 		return err
 	}
@@ -30,11 +32,11 @@ func RunHeadless(opts Options) error {
 		}
 	}
 
-	target, err := destinationPath(parent, repo)
+	target, err := core.DestinationPath(parent, repo)
 	if err != nil {
 		return err
 	}
-	if nonEmptyDir(target) {
+	if core.NonEmptyDir(target) {
 		if !opts.Overwrite {
 			return fmt.Errorf("la cartella %s esiste già e non è vuota (usa -force per sostituirla)", target)
 		}
@@ -56,27 +58,49 @@ func RunHeadless(opts Options) error {
 	elapsed := time.Since(started).Round(time.Second)
 
 	if !opts.NoBuild {
-		build := buildRepository(target)
-		switch {
-		case build.skipped:
-			fmt.Fprintln(os.Stderr, "Nessuna build riconosciuta: clone completato.")
-		case build.err != nil:
-			fmt.Fprintf(os.Stderr, "Attenzione: build fallita (%s): %s\n", build.command, compactError(build.err))
-		default:
-			fmt.Fprintf(os.Stderr, "Build completata (%s) in %s.\n", build.command, build.duration.Round(time.Second))
-		}
-	}
+		// The history write runs concurrently with the build: one disk round-trip
+		// hidden behind several seconds of compilation.
+		var historyWG sync.WaitGroup
+		historyWG.Add(1)
+		go func() {
+			defer historyWG.Done()
+			saveHistoryAsync(core.Entry{Repository: repo, Target: target})
+		}()
 
-	entry := historyEntry{repository: repo, Target: target}
-	_ = saveHistory(upsertHistory(loadHistory(), entry))
+		build := core.BuildProject(context.Background(), target)
+		switch {
+		case build.Skipped:
+			fmt.Fprintln(os.Stderr, "Nessuna build riconosciuta: clone completato.")
+		case build.Err != nil:
+			fmt.Fprintf(os.Stderr, "Attenzione: build fallita (%s): %s\n", build.Command, core.CompactError(build.Err))
+		default:
+			fmt.Fprintf(os.Stderr, "Build completata (%s) in %s.\n", build.Command, build.Duration.Round(time.Second))
+		}
+		historyWG.Wait()
+	} else {
+		saveHistoryAsync(core.Entry{Repository: repo, Target: target})
+	}
 
 	fmt.Fprintf(os.Stderr, "Fatto in %s.\n", elapsed)
 	fmt.Println(target)
 	return nil
 }
 
-// headlessClone runs git clone with progress streamed straight to stderr.
-func headlessClone(repo repository, branch string, depth int, target string) error {
+// saveHistoryAsync upserts an entry into the on-disk history without ever
+// failing the fetch: a broken history file must not undo a successful clone.
+func saveHistoryAsync(entry core.Entry) {
+	dir, err := core.DefaultStoreDir()
+	if err != nil {
+		return
+	}
+	store := core.NewStore(dir)
+	_ = store.Save(core.Upsert(store.Load(), entry))
+}
+
+// headlessClone runs git clone with progress streamed straight to stderr. The
+// scanner goroutine writes output lines concurrently with git, so cloning a
+// large repository never stalls on a synchronous print.
+func headlessClone(repo core.Repository, branch string, depth int, target string) error {
 	args := []string{"clone", "--progress"}
 	if branch != "" {
 		args = append(args, "--branch", branch)
@@ -86,14 +110,14 @@ func headlessClone(repo repository, branch string, depth int, target string) err
 	}
 	args = append(args, repo.URL, target)
 
-	cmd := exec.CommandContext(context.Background(), "git", args...)
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	cmd := core.GitCommand(context.Background(), args...)
 
 	reader, writer := io.Pipe()
 	cmd.Stdout = writer
 	cmd.Stderr = writer
 
 	var combined strings.Builder
+	var combinedMu sync.Mutex
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -101,8 +125,10 @@ func headlessClone(repo repository, branch string, depth int, target string) err
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 		for scanner.Scan() {
 			line := scanner.Text()
+			combinedMu.Lock()
 			combined.WriteString(line)
 			combined.WriteByte('\n')
+			combinedMu.Unlock()
 			fmt.Fprintln(os.Stderr, line)
 		}
 	}()
@@ -110,5 +136,9 @@ func headlessClone(repo repository, branch string, depth int, target string) err
 	runErr := cmd.Run()
 	writer.Close()
 	<-done
-	return friendlyCloneError(runErr, combined.String(), target)
+
+	combinedMu.Lock()
+	output := combined.String()
+	combinedMu.Unlock()
+	return core.FriendlyCloneError(runErr, output, target)
 }

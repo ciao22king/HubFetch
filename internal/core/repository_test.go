@@ -1,6 +1,7 @@
-package app
+package core
 
 import (
+	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -28,12 +29,12 @@ func TestParseRepository(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := parseRepository(tt.input)
+			got, err := ParseRepository(tt.input)
 			if err != nil {
-				t.Fatalf("parseRepository() error = %v", err)
+				t.Fatalf("ParseRepository() error = %v", err)
 			}
 			if got.Provider != tt.provider || got.Name != tt.repoName {
-				t.Fatalf("parseRepository() = %#v, want provider %q name %q", got, tt.provider, tt.repoName)
+				t.Fatalf("ParseRepository() = %#v, want provider %q name %q", got, tt.provider, tt.repoName)
 			}
 		})
 	}
@@ -53,8 +54,8 @@ func TestParseRepositoryRejects(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, err := parseRepository(tt.input); err == nil {
-				t.Fatalf("parseRepository(%q) accepted invalid input", tt.input)
+			if _, err := ParseRepository(tt.input); err == nil {
+				t.Fatalf("ParseRepository(%q) accepted invalid input", tt.input)
 			}
 		})
 	}
@@ -74,34 +75,47 @@ func TestSanitizeRepoName(t *testing.T) {
 		{"...", "repository"},
 	}
 	for _, tt := range tests {
-		if got := sanitizeRepoName(tt.input); got != tt.want {
-			t.Fatalf("sanitizeRepoName(%q) = %q, want %q", tt.input, got, tt.want)
+		if got := SanitizeRepoName(tt.input); got != tt.want {
+			t.Fatalf("SanitizeRepoName(%q) = %q, want %q", tt.input, got, tt.want)
 		}
 	}
 }
 
 func TestDestinationPathIsAbsoluteAndExpandsHome(t *testing.T) {
-	got, err := destinationPath("~", repository{Name: "project"})
+	got, err := DestinationPath("~", Repository{Name: "project"})
 	if err != nil {
-		t.Fatalf("destinationPath() error = %v", err)
+		t.Fatalf("DestinationPath() error = %v", err)
 	}
 	if !filepath.IsAbs(got) {
-		t.Fatalf("destinationPath() = %q, want an absolute path", got)
+		t.Fatalf("DestinationPath() = %q, want an absolute path", got)
 	}
 	if filepath.Base(got) != "project" {
-		t.Fatalf("destinationPath() = %q, want it to end in project", got)
+		t.Fatalf("DestinationPath() = %q, want it to end in project", got)
 	}
 	if runtime.GOOS != "windows" && filepath.Base(filepath.Dir(got)) == "~" {
-		t.Fatalf("destinationPath() did not expand the home directory: %q", got)
+		t.Fatalf("DestinationPath() did not expand the home directory: %q", got)
 	}
 }
 
 func TestDestinationPathDefaultsToWorkingDirectory(t *testing.T) {
-	got, err := destinationPath("", repository{Name: "project"})
+	got, err := DestinationPath("", Repository{Name: "project"})
 	if err != nil {
-		t.Fatalf("destinationPath() error = %v", err)
+		t.Fatalf("DestinationPath() error = %v", err)
 	}
 	if !filepath.IsAbs(got) {
-		t.Fatalf("destinationPath() = %q, want an absolute path", got)
+		t.Fatalf("DestinationPath() = %q, want an absolute path", got)
+	}
+}
+
+func TestExpandHome(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("no home directory available")
+	}
+	if got := ExpandHome("~/code"); got != filepath.Join(home, "code") {
+		t.Fatalf("ExpandHome(~/code) = %q, want %q", got, filepath.Join(home, "code"))
+	}
+	if got := ExpandHome("/absolute/path"); got != "/absolute/path" {
+		t.Fatalf("ExpandHome should leave absolute paths alone, got %q", got)
 	}
 }
