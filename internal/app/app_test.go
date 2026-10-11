@@ -3,6 +3,7 @@ package app
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -31,11 +32,11 @@ func newTestModel(t *testing.T, opts Options) model {
 func apply(t *testing.T, m model, msg tea.Msg) (model, tea.Cmd) {
 	t.Helper()
 	updated, cmd := m.Update(msg)
-	next, ok := updated.(model)
+	next, ok := updated.(*model)
 	if !ok {
-		t.Fatalf("Update() returned %T, want model", updated)
+		t.Fatalf("Update() returned %T, want *model", updated)
 	}
-	return next, cmd
+	return *next, cmd
 }
 
 func TestFlowURLToBranchToDestination(t *testing.T) {
@@ -198,8 +199,16 @@ func TestInvalidURLKeepsUserOnURLScreen(t *testing.T) {
 func TestQuitKeyIgnoredWhileTyping(t *testing.T) {
 	m := newTestModel(t, Options{InitialURL: "https://github.com/owner/project"})
 	m, cmd := apply(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
-	if cmd != nil || m.quitting {
+	if cmd != nil {
+		if _, isQuit := cmd().(tea.QuitMsg); isQuit {
+			t.Fatal("pressing q while typing a URL must not quit")
+		}
+	}
+	if m.quitting {
 		t.Fatal("pressing q while typing a URL must not quit")
+	}
+	if v := m.urlInput.Value(); !strings.HasSuffix(v, "q") {
+		t.Fatalf("url input = %q, want it to end with the typed q", v)
 	}
 }
 

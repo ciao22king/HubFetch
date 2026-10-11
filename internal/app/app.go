@@ -69,6 +69,7 @@ type model struct {
 	quitting    bool
 	// urlSubmitted blocks duplicate Enter presses on the URL screen from
 	// launching parallel ls-remote lookups for the same repository.
+	lastKey          tea.KeyType // last key seen; used to re-arm Enter after auto-repeat
 	urlSubmitted     bool
 	searchActive     bool
 	confirmOverwrite bool
@@ -329,6 +330,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.KeyMsg:
+		m.lastKey = msg.Type
 		// Global shortcuts (ctrl+c, open, copy, quit…) win over the screens —
 		// but only when they actually *consume* the key. handleGlobalKey returns
 		// handled=true exclusively for keys it acted upon; plain typing like "q"
@@ -625,7 +627,7 @@ func (m *model) updateURL(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if key.Matches(msg, appKeys.enter) {
-			if m.urlSubmitted && msg.String() == "enter" {
+			if m.urlSubmitted && m.lastKey == tea.KeyRunes {
 				// Enter is being held down (auto-repeat): ignore the extra
 				// presses so one submission can never spawn parallel lookups.
 				return m, nil
@@ -650,16 +652,9 @@ func (m *model) updateURL(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(textinput.Blink, fetchRemoteBranches(repo.URL))
 		}
 	default:
-		// Backspace/delete/reset re-arms Enter after a held-key repeat.
-		switch msg.(type) {
-		case tea.KeyMsg:
-			km := msg.(tea.KeyMsg)
-			if km.Type != tea.KeyRunes {
-				m.urlSubmitted = false
-			}
-		default:
-			m.urlSubmitted = false
-		}
+		// Any other key (backspace, delete, arrows…) re-arms Enter after a
+		// held-key auto-repeat so a fresh press can submit again.
+		m.urlSubmitted = false
 	}
 	var cmd tea.Cmd
 	m.urlInput, cmd = m.urlInput.Update(msg)

@@ -88,6 +88,12 @@ func ParseRepository(raw string) (Repository, error) {
 		host = strings.TrimPrefix(userHost, "git@")
 		repoPath = sshPath
 	default:
+		// Windows temp paths look like "C:\Users\…" — the colon before a
+		// backslash makes url.Parse read "\Users…" as an invalid port. Turn
+		// plain absolute filesystem paths into proper file:// URLs first.
+		if isWindowsAbsPath(normalized) {
+			normalized = "file:///" + strings.ReplaceAll(normalized, "\\", "/")
+		}
 		parsed, err := url.Parse(normalized)
 		if err != nil {
 			return Repository{}, fmt.Errorf("%w: %v", invalidURLErr, err)
@@ -128,6 +134,18 @@ func ParseRepository(raw string) (Repository, error) {
 		Provider: Provider(host),
 		Name:     SanitizeRepoName(segments[len(segments)-1]),
 	}, nil
+}
+
+// isWindowsAbsPath reports whether s looks like a bare Windows absolute path
+// ("C:\foo" or "C:/foo"). Such strings must not go through url.Parse as-is:
+// the drive colon makes net/url try to read the remainder as a port number.
+func isWindowsAbsPath(s string) bool {
+	if len(s) < 3 || s[1] != ':' {
+		return false
+	}
+	c := s[0]
+	drive := (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+	return drive && (s[2] == '\\' || s[2] == '/')
 }
 
 func looksLikeHost(host string) bool {
