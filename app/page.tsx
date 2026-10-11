@@ -9,7 +9,7 @@ const workflow = ["Paste a repository URL", "Choose your destination", "HubFetch
 export default function Home() {
   return (
     <main>
-      <nav className="nav shell">
+      <nav className="nav shell" aria-label="Primary navigation">
         <a className="brand" href="#top" aria-label="HubFetch home"><span className="brand-mark">↳</span> hubfetch</a>
         <div className="nav-links"><a href="#why">Why HubFetch</a><a href="#workflow">How it works</a><a href="#faq">FAQ</a><a href="https://github.com/ciao22king/HubFetch" target="_blank" rel="noreferrer">GitHub ↗</a></div>
         <a className="nav-cta" href="#install">Try it <span>→</span></a>
@@ -44,7 +44,7 @@ export default function Home() {
 
       <section className="help shell" id="help"><div className="help-heading"><p className="eyebrow">Want to help?</p><h2>Make HubFetch<br /><em>better with us.</em></h2><p>HubFetch grows through small, practical contributions. You do not need to be an expert or know the whole codebase to get started.</p></div><div className="help-steps"><article><span>01</span><h3>Find an issue</h3><p>Open the GitHub issues and choose a bug, idea, or improvement that matches your experience.</p></article><article><span>02</span><h3>Fork and build</h3><p>Fork the repository, create a focused branch, and make your change locally with Go.</p></article><article><span>03</span><h3>Share a pull request</h3><p>Explain what changed, test it, and open a pull request. Every thoughtful review helps too.</p></article></div><div className="help-actions"><a className="button button-primary" href="https://github.com/ciao22king/HubFetch" target="_blank" rel="noreferrer">Contribute on GitHub <span>↗</span></a><a className="discord-link" href="https://discord.com/users/el_gamer25_25977" target="_blank" rel="noreferrer"><span className="discord-icon">◎</span><span><strong>Need help or want to talk?</strong><small>Reach me on Discord: <b>el_gamer25_25977</b></small></span><span className="discord-arrow">↗</span></a></div></section>
 
-      <footer className="footer shell"><a className="brand" href="#top"><span className="brand-mark">↳</span> hubfetch</a><p>More time building. Less time preparing.</p><p>© 2026 HubFetch · MIT License</p></footer>
+      <footer className="footer shell"><a className="brand" href="#top" aria-label="HubFetch home"><span className="brand-mark">↳</span> hubfetch</a><p>More time building. Less time preparing.</p><div className="footer-meta"><a href="https://github.com/ciao22king/HubFetch" target="_blank" rel="noreferrer">GitHub ↗</a><span>© 2026 HubFetch · MIT License</span></div></footer>
     </main>
   )
 }
