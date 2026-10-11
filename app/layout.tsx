@@ -3,7 +3,7 @@ import "./globals.css"
 
 export const metadata: Metadata = {
   title: "HubFetch — From repo URL to ready-to-code",
-  description: "A calm, keyboard-first way to clone, build and revisit Git repositories.",
+  description: "HubFetch rende semplice clonare, preparare e ritrovare repository Git: meno attrito, più tempo per costruire.",
 }
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
