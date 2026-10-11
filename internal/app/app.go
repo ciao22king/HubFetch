@@ -172,7 +172,8 @@ var appKeys = keys{
 
 // Run starts the interactive program.
 func Run(opts Options) error {
-	program := tea.NewProgram(newModel(opts), tea.WithAltScreen())
+	m := newModel(opts)
+	program := tea.NewProgram(&m, tea.WithAltScreen())
 	_, err := program.Run()
 	return err
 }
@@ -277,7 +278,7 @@ func (m *model) refreshFilter() {
 	}
 }
 
-func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
@@ -364,7 +365,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m model) applyClipboard(msg clipboardMsg) (tea.Model, tea.Cmd) {
+func (m *model) applyClipboard(msg clipboardMsg) (tea.Model, tea.Cmd) {
 	if msg.err != nil {
 		m.status = "Clipboard non disponibile: " + core.CompactError(msg.err)
 		return m, nil
@@ -388,7 +389,7 @@ func (m model) applyClipboard(msg clipboardMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m model) recordProgress(msg progressMsg) (tea.Model, tea.Cmd) {
+func (m *model) recordProgress(msg progressMsg) (tea.Model, tea.Cmd) {
 	if m.screen == cloningScreen && strings.TrimSpace(msg.line) != "" {
 		m.progressLog = append(m.progressLog, msg.line)
 		if len(m.progressLog) > maxProgressLines {
@@ -401,7 +402,7 @@ func (m model) recordProgress(msg progressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m model) applyFetchResult(msg fetchResultMsg) (tea.Model, tea.Cmd) {
+func (m *model) applyFetchResult(msg fetchResultMsg) (tea.Model, tea.Cmd) {
 	m.cancelClone = nil
 	m.result = msg
 	m.progressChan = nil
@@ -435,7 +436,7 @@ func (m model) applyFetchResult(msg fetchResultMsg) (tea.Model, tea.Cmd) {
 // handleGlobalKey covers shortcuts that behave the same everywhere. Typing
 // shortcuts like "q" are deliberately excluded from text-entry screens so a URL
 // or a path containing the letter q can never quit the app.
-func (m model) handleGlobalKey(msg tea.KeyMsg) (tea.Cmd, bool) {
+func (m *model) handleGlobalKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	if msg.Type == tea.KeyCtrlC {
 		if m.cancelClone != nil {
 			m.cancelClone()
@@ -486,17 +487,14 @@ func (m model) handleGlobalKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 			return nil, true
 		}
 		if key.Matches(msg, appKeys.search) {
-			m.searchActive = true
-			m.status = ""
-			m.err = nil
-			m.searchInput.Focus()
+			m.activateSearch()
 			return textinput.Blink, true
 		}
 	}
 	return nil, false
 }
 
-func (m model) updateHistory(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *model) updateHistory(msg tea.Msg) (tea.Model, tea.Cmd) {
 	keyMsg, ok := msg.(tea.KeyMsg)
 	if !ok {
 		return m, nil
@@ -531,47 +529,64 @@ func (m model) updateHistory(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
-	switch keyMsg.String() {
-	case "up", "k":
+	switch keyMsg.Type {
+	case tea.KeyUp:
 		m.moveSelection(-1)
-	case "down", "j":
+	case tea.KeyDown:
 		m.moveSelection(1)
-	case "n", "c":
-		m.status = ""
-		m.err = nil
-		m.screen = urlScreen
-		m.urlInput.SetValue("")
-		m.urlInput.Focus()
+	case tea.KeyCtrlL:
+		m.activateSearch()
 		return m, textinput.Blink
-	case "r":
-		if m.store != nil {
-			m.history = m.store.Load()
-			m.refreshFilter()
-		}
-		m.status = "Cronologia aggiornata."
-	case "u":
-		// Update the selected clone in place with a fast-forward pull.
-		if len(m.filtered) > 0 && m.pendingPull == "" {
-			entry := m.history[m.filtered[m.selected]]
-			m.pendingPull = entry.Target
-			m.status = "Aggiorno " + entry.Label() + "…"
-			return m, pullRepository(entry.Target)
-		}
-	case "ctrl+l", "/":
-		m.searchActive = true
-		m.status = ""
-		m.searchInput.Focus()
-		return m, textinput.Blink
-	case "ctrl+d":
+	case tea.KeyCtrlD:
 		m.removeSelected()
-	case "enter":
+	case tea.KeyEnter:
 		if len(m.filtered) > 0 {
 			entry := m.history[m.filtered[m.selected]]
 			m.status = "Apro " + entry.Label() + "…"
 			return m, openRepository(entry.Target)
 		}
+	case tea.KeyRunes:
+		switch string(keyMsg.Runes) {
+		case "k":
+			m.moveSelection(-1)
+		case "j":
+			m.moveSelection(1)
+		case "n", "c":
+			m.status = ""
+			m.err = nil
+			m.screen = urlScreen
+			m.urlInput.SetValue("")
+			m.urlInput.Focus()
+			return m, textinput.Blink
+		case "r":
+			if m.store != nil {
+				m.history = m.store.Load()
+				m.refreshFilter()
+			}
+			m.status = "Cronologia aggiornata."
+		case "u":
+			// Update the selected clone in place with a fast-forward pull.
+			if len(m.filtered) > 0 && m.pendingPull == "" {
+				entry := m.history[m.filtered[m.selected]]
+				m.pendingPull = entry.Target
+				m.status = "Aggiorno " + entry.Label() + "…"
+				return m, pullRepository(entry.Target)
+			}
+		case "/":
+			m.activateSearch()
+			return m, textinput.Blink
+		}
 	}
 	return m, nil
+}
+
+// activateSearch focuses the history search field. It lives here so both the
+// global shortcut path and the history screen path share one implementation.
+func (m *model) activateSearch() {
+	m.searchActive = true
+	m.status = ""
+	m.err = nil
+	m.searchInput.Focus()
 }
 
 func (m *model) moveSelection(delta int) {
@@ -599,7 +614,7 @@ func (m *model) removeSelected() {
 	}
 }
 
-func (m model) updateURL(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *model) updateURL(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		if key.Matches(msg, appKeys.back) {
@@ -653,7 +668,7 @@ func (m model) updateURL(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // updateBranch lets the user optionally type a branch to clone. Leaving the
 // field empty clones the remote's default branch, so Enter always continues.
-func (m model) updateBranch(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *model) updateBranch(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		if key.Matches(msg, appKeys.back) {
@@ -697,7 +712,7 @@ func (m model) updateBranch(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m model) updateDestination(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *model) updateDestination(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		if m.confirmOverwrite {
@@ -759,7 +774,7 @@ func (m model) updateDestination(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m model) startClone(overwrite bool) (tea.Model, tea.Cmd) {
+func (m *model) startClone(overwrite bool) (tea.Model, tea.Cmd) {
 	m.status = ""
 	m.screen = cloningScreen
 	m.startedAt = time.Now()
@@ -783,7 +798,7 @@ func (m *model) nextSuggestion() string {
 	return suggestions[m.suggestionIndex]
 }
 
-func (m model) updateResult(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *model) updateResult(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if keyMsg, ok := msg.(tea.KeyMsg); ok {
 		switch {
 		case key.Matches(keyMsg, appKeys.enter):
